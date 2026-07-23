@@ -36,8 +36,25 @@ checksum:
 changelog:
   disable: true
 
-# 仅 GHCR x86_64 镜像
+# x86_64 镜像：Docker Hub（可选）+ GHCR
 dockers:
+  - id: dockerhub-amd64
+    goos: linux
+    goarch: amd64
+    skip_push: '{{ if eq .Env.DOCKERHUB_USERNAME "skip" }}true{{ else }}false{{ end }}'
+    image_templates:
+      - "{{ .Env.DOCKERHUB_USERNAME }}/sub2api:{{ .Version }}"
+      - "{{ .Env.DOCKERHUB_USERNAME }}/sub2api:latest"
+    dockerfile: Dockerfile.goreleaser
+    use: buildx
+    extra_files:
+      - deploy/docker-entrypoint.sh
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .Commit }}"
+      - "--label=org.opencontainers.image.source=https://github.com/{{ .Env.GITHUB_REPO_OWNER }}/{{ .Env.GITHUB_REPO_NAME }}"
+
   - id: ghcr-amd64
     goos: linux
     goarch: amd64
@@ -69,7 +86,7 @@ release:
   skip_upload: true
   header: |
     > AI API Gateway Platform - 将 AI 订阅配额分发和管理
-    > ⚡ Simple Release: 仅包含 x86_64 GHCR 镜像
+    > ⚡ Simple Release: 仅包含 x86_64 镜像
 
     {{ .Env.TAG_MESSAGE }}
 
@@ -80,6 +97,12 @@ release:
 
     **Docker (x86_64 only):**
     ```bash
+    {{ if ne .Env.DOCKERHUB_USERNAME "skip" -}}
+    # Docker Hub
+    docker pull {{ .Env.DOCKERHUB_USERNAME }}/sub2api:{{ .Version }}
+
+    {{ end -}}
+    # GitHub Container Registry
     docker pull ghcr.io/{{ .Env.GITHUB_REPO_OWNER_LOWER }}/sub2api:{{ .Version }}
     ```
 
