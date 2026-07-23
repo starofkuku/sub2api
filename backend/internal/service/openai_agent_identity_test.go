@@ -158,6 +158,76 @@ func TestEnsureAgentIdentityTaskPersistsAndRedactsCredentials(t *testing.T) {
 	require.NotContains(t, string(mustAgentIdentityJSON(t, redacted)), privateKey)
 }
 
+func TestEnsureAgentIdentityTaskRegistration403TempUnschedulesAccount(t *testing.T) {
+	key, privateKey := newTestAgentIdentityKey(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
+	}))
+	defer server.Close()
+	oldBase := openAIAgentIdentityAuthAPIBaseURL
+	openAIAgentIdentityAuthAPIBaseURL = server.URL
+	t.Cleanup(func() { openAIAgentIdentityAuthAPIBaseURL = oldBase })
+
+	account := &Account{
+		ID:       42,
+		Type:     AccountTypeOAuth,
+		Platform: PlatformOpenAI,
+		Credentials: map[string]any{
+			"auth_mode":         OpenAIAuthModeAgentIdentity,
+			"agent_runtime_id":  key.runtimeID,
+			"agent_private_key": privateKey,
+		},
+	}
+	repo := &agentIdentityCredentialsRepo{account: account}
+	svc := &OpenAIGatewayService{accountRepo: repo}
+
+	before := time.Now()
+	err := svc.ensureAgentIdentityTask(context.Background(), account, "")
+	after := time.Now()
+	require.Error(t, err)
+	require.True(t, isAgentIdentityAuthCredentialFailure(err))
+	var regErr *agentIdentityTaskRegistrationError
+	require.ErrorAs(t, err, &regErr)
+	require.Equal(t, http.StatusForbidden, regErr.StatusCode())
+
+	require.Equal(t, 1, repo.tempUnschedCalls)
+	require.Equal(t, int64(42), repo.lastTempUnschedID)
+	require.Contains(t, repo.lastTempUnschedReason, "agent task registration returned status 403")
+	require.NotNil(t, account.TempUnschedulableUntil)
+	require.True(t, account.TempUnschedulableUntil.After(before.Add(agentIdentityAuthFailureTempUnschedDuration-time.Second)))
+	require.True(t, account.TempUnschedulableUntil.Before(after.Add(agentIdentityAuthFailureTempUnschedDuration+time.Second)))
+	require.False(t, account.IsSchedulable())
+	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
+}
+
+func TestRegisterAgentIdentityTaskNetworkErrorDoesNotTempUnschedule(t *testing.T) {
+	key, privateKey := newTestAgentIdentityKey(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"temporary"}`, http.StatusBadGateway)
+	}))
+	defer server.Close()
+	oldBase := openAIAgentIdentityAuthAPIBaseURL
+	openAIAgentIdentityAuthAPIBaseURL = server.URL
+	t.Cleanup(func() { openAIAgentIdentityAuthAPIBaseURL = oldBase })
+
+	account := &Account{
+		ID:       43,
+		Type:     AccountTypeOAuth,
+		Platform: PlatformOpenAI,
+		Credentials: map[string]any{
+			"auth_mode":         OpenAIAuthModeAgentIdentity,
+			"agent_runtime_id":  key.runtimeID,
+			"agent_private_key": privateKey,
+		},
+	}
+	repo := &agentIdentityCredentialsRepo{account: account}
+	err := ensureAgentIdentityTaskForAccount(context.Background(), repo, nil, &sync.Mutex{}, account, "")
+	require.Error(t, err)
+	require.False(t, isAgentIdentityAuthCredentialFailure(err))
+	require.Equal(t, 0, repo.tempUnschedCalls)
+	require.Nil(t, account.TempUnschedulableUntil)
+}
+
 func TestEnsureAgentIdentityTaskSharesLockAcrossServicesForSameAccount(t *testing.T) {
 	key, privateKey := newTestAgentIdentityKey(t)
 	account := &Account{ID: 9001, Type: AccountTypeOAuth, Platform: PlatformOpenAI, Credentials: map[string]any{
@@ -205,9 +275,12 @@ func cloneAgentIdentityTestAccount(account *Account) *Account {
 
 type agentIdentityCredentialsRepo struct {
 	AccountRepository
-	credentials map[string]any
-	account     *Account
-	mu          sync.Mutex
+	credentials           map[string]any
+	account               *Account
+	mu                    sync.Mutex
+	tempUnschedCalls      int
+	lastTempUnschedID     int64
+	lastTempUnschedReason string
 }
 
 func (r *agentIdentityCredentialsRepo) GetByID(_ context.Context, _ int64) (*Account, error) {
@@ -218,6 +291,23 @@ func (r *agentIdentityCredentialsRepo) UpdateCredentials(_ context.Context, _ in
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.credentials = credentials
+	if r.account != nil {
+		r.account.Credentials = credentials
+	}
+	return nil
+}
+
+func (r *agentIdentityCredentialsRepo) SetTempUnschedulable(_ context.Context, id int64, until time.Time, reason string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.tempUnschedCalls++
+	r.lastTempUnschedID = id
+	r.lastTempUnschedReason = reason
+	if r.account != nil && r.account.ID == id {
+		untilCopy := until
+		r.account.TempUnschedulableUntil = &untilCopy
+		r.account.TempUnschedulableReason = reason
+	}
 	return nil
 }
 

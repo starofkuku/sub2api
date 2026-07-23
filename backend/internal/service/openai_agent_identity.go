@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -22,9 +23,10 @@ import (
 )
 
 const (
-	OpenAIAuthModeAgentIdentity          = "agentIdentity"
-	agentIdentityAuthAPIBaseURL          = "https://auth.openai.com/api/accounts"
-	agentIdentityTaskRegistrationTimeout = 30 * time.Second
+	OpenAIAuthModeAgentIdentity                 = "agentIdentity"
+	agentIdentityAuthAPIBaseURL                 = "https://auth.openai.com/api/accounts"
+	agentIdentityTaskRegistrationTimeout        = 30 * time.Second
+	agentIdentityAuthFailureTempUnschedDuration = 10 * time.Minute
 )
 
 var openAIAgentIdentityAuthAPIBaseURL = agentIdentityAuthAPIBaseURL
@@ -52,6 +54,83 @@ type agentIdentityTaskRecoveredError struct{}
 
 func (e *agentIdentityTaskRecoveredError) Error() string {
 	return "agent identity task recovered"
+}
+
+// agentIdentityTaskRegistrationError is returned when OpenAI rejects or fails
+// agent task registration. Callers use the status code to decide whether the
+// account should leave the scheduling pool.
+type agentIdentityTaskRegistrationError struct {
+	statusCode int
+}
+
+func (e *agentIdentityTaskRegistrationError) Error() string {
+	if e == nil {
+		return "agent task registration failed"
+	}
+	return fmt.Sprintf("agent task registration returned status %d", e.statusCode)
+}
+
+func (e *agentIdentityTaskRegistrationError) StatusCode() int {
+	if e == nil {
+		return 0
+	}
+	return e.statusCode
+}
+
+func isAgentIdentityAuthCredentialFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	var regErr *agentIdentityTaskRegistrationError
+	if errors.As(err, &regErr) {
+		switch regErr.StatusCode() {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return true
+		default:
+			return false
+		}
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "agent identity private key"),
+		strings.Contains(msg, "agent identity runtime"),
+		strings.Contains(msg, "agent identity credentials are unavailable"),
+		strings.Contains(msg, "agent identity account is nil"):
+		return true
+	default:
+		return false
+	}
+}
+
+// markAgentIdentityAuthFailureTempUnschedulable removes a broken Agent Identity
+// account from scheduling for a cooldown window so request traffic stops hammering
+// OpenAI auth with the same invalid credentials.
+func markAgentIdentityAuthFailureTempUnschedulable(ctx context.Context, repo AccountRepository, account *Account, cause error) {
+	if repo == nil || account == nil || account.ID <= 0 || cause == nil {
+		return
+	}
+	if !isAgentIdentityAuthCredentialFailure(cause) {
+		return
+	}
+	until := time.Now().Add(agentIdentityAuthFailureTempUnschedDuration)
+	reason := "agent identity authentication failed: " + cause.Error()
+	account.TempUnschedulableUntil = &until
+	account.TempUnschedulableReason = reason
+
+	bgCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), openAIAccountStateUpdateTimeout)
+	defer cancel()
+	if err := repo.SetTempUnschedulable(bgCtx, account.ID, until, reason); err != nil {
+		slog.Warn("agent_identity.temp_unschedulable_set_failed",
+			"account_id", account.ID,
+			"error", err,
+		)
+		return
+	}
+	slog.Warn("agent_identity.temp_unschedulable_set",
+		"account_id", account.ID,
+		"until", until.Format(time.RFC3339),
+		"reason", reason,
+	)
 }
 
 func (a *Account) IsOpenAIAgentIdentity() bool {
@@ -213,7 +292,7 @@ func registerAgentIdentityTask(ctx context.Context, account *Account) (string, e
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return "", fmt.Errorf("agent task registration returned status %d", resp.StatusCode)
+		return "", &agentIdentityTaskRegistrationError{statusCode: resp.StatusCode}
 	}
 	var result agentIdentityTaskRegistrationResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&result); err != nil {
@@ -248,7 +327,9 @@ func ensureAgentIdentityTaskForAccount(ctx context.Context, repo AccountReposito
 		credAccount = resolved
 	}
 	if credAccount == nil || !credAccount.IsOpenAIAgentIdentity() {
-		return errors.New("agent identity credentials are unavailable")
+		err := errors.New("agent identity credentials are unavailable")
+		markAgentIdentityAuthFailureTempUnschedulable(ctx, repo, account, err)
+		return err
 	}
 	currentTaskID := strings.TrimSpace(credAccount.GetCredential("task_id"))
 	if currentTaskID != "" && (expectedTaskID == "" || currentTaskID != expectedTaskID) {
@@ -294,6 +375,7 @@ func ensureAgentIdentityTaskForAccount(ctx context.Context, repo AccountReposito
 	}
 	newTaskID, err := registerAgentIdentityTask(ctx, credAccount)
 	if err != nil {
+		markAgentIdentityAuthFailureTempUnschedulable(ctx, repo, credAccount, err)
 		return err
 	}
 	credentials := make(map[string]any, len(credAccount.Credentials)+1)
@@ -317,7 +399,13 @@ func (s *OpenAIGatewayService) ensureAgentIdentityTask(ctx context.Context, acco
 	if s == nil {
 		return errors.New("openai gateway service is nil")
 	}
-	return ensureAgentIdentityTaskForAccount(ctx, s.accountRepo, s, &s.agentIdentityTaskMu, account, expectedTaskID)
+	err := ensureAgentIdentityTaskForAccount(ctx, s.accountRepo, s, &s.agentIdentityTaskMu, account, expectedTaskID)
+	if err != nil && isAgentIdentityAuthCredentialFailure(err) {
+		// Immediate in-process block so the next selection skips this account
+		// before DB/scheduler snapshot propagation completes.
+		s.BlockAccountScheduling(account, time.Now().Add(agentIdentityAuthFailureTempUnschedDuration), "agent_identity_auth_failure")
+	}
+	return err
 }
 
 func isAgentIdentityTaskInvalidHTTPResponse(statusCode int, body []byte) bool {
@@ -401,6 +489,7 @@ func buildAgentIdentityAuthenticationHeaders(ctx context.Context, repo AccountRe
 	}
 	key, err := agentIdentityKeyFromAccount(account)
 	if err != nil {
+		markAgentIdentityAuthFailureTempUnschedulable(ctx, repo, account, err)
 		return nil, err
 	}
 	assertion, err := buildAgentAssertion(key, time.Now())
